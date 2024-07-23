@@ -16,3 +16,4 @@ jobs:
           owner: anaclaudiar
           base: master
           head: main
+          auto_merge: false

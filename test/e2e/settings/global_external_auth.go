@@ -32,8 +32,8 @@ import (
 )
 
 const (
-	disable                = "false"
-	noAuthLocaltionSetting = "no-auth-locations"
+	disable               = "false"
+	noAuthLocationSetting = "no-auth-locations"
 )
 
 var _ = framework.DescribeSetting("[Security] global-auth-url", func() {
@@ -51,7 +51,7 @@ var _ = framework.DescribeSetting("[Security] global-auth-url", func() {
 	fooPath := "/foo"
 	barPath := "/bar"
 
-	noAuthSetting := noAuthLocaltionSetting
+	noAuthSetting := noAuthLocationSetting
 	noAuthLocations := barPath
 
 	enableGlobalExternalAuthAnnotation := "nginx.ingress.kubernetes.io/enable-global-auth"
@@ -69,7 +69,7 @@ var _ = framework.DescribeSetting("[Security] global-auth-url", func() {
 			f.EnsureIngress(fooIng)
 			f.WaitForNginxServer(host,
 				func(server string) bool {
-					return strings.Contains(server, "location /foo")
+					return strings.Contains(server, `location "/foo/"`)
 				})
 
 			ginkgo.By("Adding an ingress rule for /bar")
@@ -77,7 +77,7 @@ var _ = framework.DescribeSetting("[Security] global-auth-url", func() {
 			f.EnsureIngress(barIng)
 			f.WaitForNginxServer(host,
 				func(server string) bool {
-					return strings.Contains(server, "location /bar")
+					return strings.Contains(server, `location "/bar/"`)
 				})
 
 			ginkgo.By("Adding a global-auth-url to configMap")
@@ -137,7 +137,7 @@ var _ = framework.DescribeSetting("[Security] global-auth-url", func() {
 
 			f.WaitForNginxServer(host,
 				func(server string) bool {
-					return strings.Contains(server, "location /bar")
+					return strings.Contains(server, `location "/bar/"`)
 				})
 
 			ginkgo.By("Sending a request to protected service /foo")
@@ -315,7 +315,7 @@ http {
 			f.EnsureIngress(ing2)
 
 			f.WaitForNginxServer(host, func(server string) bool {
-				return strings.Contains(server, "server_name "+host)
+				return strings.Contains(server, fmt.Sprintf(`server_name "%v"`, host))
 			})
 		})
 

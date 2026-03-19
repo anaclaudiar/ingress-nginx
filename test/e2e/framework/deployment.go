@@ -43,11 +43,11 @@ const HTTPBunService = "httpbun"
 // NipService name of external service using nip.io
 const NIPService = "external-nip"
 
-// HTTPBunImage is the default image that is used to deploy HTTPBun with the framwork
+// HTTPBunImage is the default image that is used to deploy HTTPBun with the framework
 var HTTPBunImage = os.Getenv("HTTPBUN_IMAGE")
 
 // EchoImage is the default image to be used by the echo service
-const EchoImage = "registry.k8s.io/ingress-nginx/e2e-test-echo@sha256:4938d1d91a2b7d19454460a8c1b010b89f6ff92d2987fd889ac3e8fc3b70d91a" //#nosec G101
+const EchoImage = "registry.k8s.io/ingress-nginx/e2e-test-echo:v1.2.9@sha256:9920d084b452b38ee663005a455aa7ed12c15afa512741ea9596e206a189bdf0" //#nosec G101
 
 // TODO: change all Deployment functions to use these options
 // in order to reduce complexity and have a unified API across the
@@ -158,7 +158,7 @@ func (f *Framework) NewEchoDeployment(opts ...func(*deploymentOptions)) {
 	assert.Nil(ginkgo.GinkgoT(), err, "waiting for endpoints to become ready")
 }
 
-// BuildNipHost used to generate a nip host for DNS resolving
+// BuildNIPHost used to generate a nip host for DNS resolving
 func BuildNIPHost(ip string) string {
 	return fmt.Sprintf("%s.nip.io", ip)
 }

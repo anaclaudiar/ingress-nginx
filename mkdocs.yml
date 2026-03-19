@@ -24,7 +24,7 @@ markdown_extensions:
   - pymdownx.critic
   - pymdownx.details
   - pymdownx.emoji:
-      emoji_index: !!python/name:materialx.emoji.twemoji
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:materialx.emoji.to_svg
   - pymdownx.highlight
   - pymdownx.inlinehilite
@@ -50,6 +50,7 @@ theme:
     - navigation.tabs.sticky
     - navigation.instant
     - navigation.sections
+    - content.code.copy
 
   palette:
     primary: "teal"
@@ -78,11 +79,12 @@ nav:
       - Role Based Access Control (RBAC): "deploy/rbac.md"
       - Upgrade: "deploy/upgrade.md"
       - Hardening guide: "deploy/hardening-guide.md"
-  - User guide:
+  - User Guide:
       - NGINX Configuration:
           - Introduction: "user-guide/nginx-configuration/index.md"
           - Basic usage: "user-guide/basic-usage.md"
           - Annotations: "user-guide/nginx-configuration/annotations.md"
+          - Annotations Risks: "user-guide/nginx-configuration/annotations-risk.md"
           - ConfigMap: "user-guide/nginx-configuration/configmap.md"
           - Custom NGINX template: "user-guide/nginx-configuration/custom-template.md"
           - Log format: "user-guide/nginx-configuration/log-format.md"
@@ -123,7 +125,6 @@ nav:
       - Rewrite: "examples/rewrite/README.md"
       - Static IPs: "examples/static-ip/README.md"
       - TLS termination: "examples/tls-termination/README.md"
-      - Pod Security Policy (PSP): "examples/psp/README.md"
       - Open Policy Agent rules: "examples/openpolicyagent/README.md"
       - Canary Deployments: "examples/canary/README.md"
   - Developer Guide:

@@ -35,9 +35,10 @@ import (
 	"syscall"
 	"text/template"
 	"time"
+	"unicode"
 
-	proxyproto "github.com/armon/go-proxyproto"
 	"github.com/eapache/channels"
+	proxyproto "github.com/pires/go-proxyproto"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -87,9 +88,10 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 	n := &NGINXController{
 		isIPV6Enabled: ing_net.IsIPv6Enabled(),
 
-		resolver:        h,
-		cfg:             config,
-		syncRateLimiter: flowcontrol.NewTokenBucketRateLimiter(config.SyncRateLimit, 1),
+		resolver:         h,
+		cfg:              config,
+		syncRateLimiter:  flowcontrol.NewTokenBucketRateLimiter(config.SyncRateLimit, 1),
+		workersReloading: false,
 
 		recorder: eventBroadcaster.NewRecorder(scheme.Scheme, apiv1.EventSource{
 			Component: "nginx-ingress-controller",
@@ -197,14 +199,16 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 		filesToWatch = append(filesToWatch, path)
 		return nil
 	})
-
 	if err != nil {
 		klog.Fatalf("Error creating file watchers: %v", err)
 	}
 
 	for _, f := range filesToWatch {
+		// This redeclaration is necessary for the closure to get the correct value for the iteration in go versions <1.22
+		// See https://go.dev/blog/loopvar-preview
+		f := f
 		_, err = file.NewFileWatcher(f, func() {
-			klog.InfoS("File changed detected. Reloading NGINX", "path", f)
+			klog.InfoS("File change detected. Reloading NGINX", "path", f)
 			n.syncQueue.EnqueueTask(task.GetDummyObject("file-change"))
 		})
 		if err != nil {
@@ -226,6 +230,8 @@ type NGINXController struct {
 	syncStatus status.Syncer
 
 	syncRateLimiter flowcontrol.RateLimiter
+
+	workersReloading bool
 
 	// stopLock is used to enforce that only a single call to Stop send at
 	// a given time. We allow stopping through an HTTP endpoint and
@@ -258,6 +264,8 @@ type NGINXController struct {
 	validationWebhookServer *http.Server
 
 	command NginxExecTester
+
+	lastConfigSuccess bool
 }
 
 // Start starts a new NGINX master process running in the foreground.
@@ -268,29 +276,32 @@ func (n *NGINXController) Start() {
 
 	// we need to use the defined ingress class to allow multiple leaders
 	// in order to update information about ingress status
-	// TODO: For now, as the the IngressClass logics has changed, is up to the
+	// TODO: For now, as the IngressClass logics has changed, is up to the
 	// cluster admin to create different Leader Election IDs.
 	// Should revisit this in a future
-	electionID := n.cfg.ElectionID
 
-	setupLeaderElection(&leaderElectionConfig{
-		Client:     n.cfg.Client,
-		ElectionID: electionID,
-		OnStartedLeading: func(stopCh chan struct{}) {
-			if n.syncStatus != nil {
-				go n.syncStatus.Run(stopCh)
-			}
+	if !n.cfg.DisableLeaderElection {
+		electionID := n.cfg.ElectionID
+		setupLeaderElection(&leaderElectionConfig{
+			Client:      n.cfg.Client,
+			ElectionID:  electionID,
+			ElectionTTL: n.cfg.ElectionTTL,
+			OnStartedLeading: func(stopCh chan struct{}) {
+				if n.syncStatus != nil {
+					go n.syncStatus.Run(stopCh)
+				}
 
-			n.metricCollector.OnStartedLeading(electionID)
-			// manually update SSL expiration metrics
-			// (to not wait for a reload)
-			n.metricCollector.SetSSLExpireTime(n.runningConfig.Servers)
-			n.metricCollector.SetSSLInfo(n.runningConfig.Servers)
-		},
-		OnStoppedLeading: func() {
-			n.metricCollector.OnStoppedLeading(electionID)
-		},
-	})
+				n.metricCollector.OnStartedLeading(electionID)
+				// manually update SSL expiration metrics
+				// (to not wait for a reload)
+				n.metricCollector.SetSSLExpireTime(n.runningConfig.Servers)
+				n.metricCollector.SetSSLInfo(n.runningConfig.Servers)
+			},
+			OnStoppedLeading: func() {
+				n.metricCollector.OnStoppedLeading(electionID)
+			},
+		})
+	}
 
 	cmd := n.command.ExecCommand()
 
@@ -634,8 +645,7 @@ func (n *NGINXController) testTemplate(cfg []byte) error {
 	if len(cfg) == 0 {
 		return fmt.Errorf("invalid NGINX configuration (empty)")
 	}
-	tmpDir := os.TempDir() + "/nginx"
-	tmpfile, err := os.CreateTemp(tmpDir, tempNginxPattern)
+	tmpfile, err := os.CreateTemp(filepath.Join(os.TempDir(), "nginx"), tempNginxPattern)
 	if err != nil {
 		return err
 	}
@@ -671,11 +681,20 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 	cfg := n.store.GetBackendConfiguration()
 	cfg.Resolver = n.resolver
 
+	workerSerialReloads := cfg.WorkerSerialReloads
+	if workerSerialReloads && n.workersReloading {
+		return errors.New("worker reload already in progress, requeuing reload")
+	}
+
 	content, err := n.generateTemplate(cfg, ingressCfg)
 	if err != nil {
 		return err
 	}
 
+	err = n.createLuaConfig(&cfg)
+	if err != nil {
+		return err
+	}
 	err = createOpentelemetryCfg(&cfg)
 	if err != nil {
 		return err
@@ -733,7 +752,39 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 		return fmt.Errorf("%v\n%v", err, string(o))
 	}
 
+	// Reload status checking runs in a separate goroutine to avoid blocking the sync queue
+	if workerSerialReloads {
+		go n.awaitWorkersReload()
+	}
+
 	return nil
+}
+
+// awaitWorkersReload checks if the number of workers has returned to the expected count
+func (n *NGINXController) awaitWorkersReload() {
+	n.workersReloading = true
+	defer func() { n.workersReloading = false }()
+
+	expectedWorkers := n.store.GetBackendConfiguration().WorkerProcesses
+	var numWorkers string
+	klog.V(3).Infof("waiting for worker count to be equal to %s", expectedWorkers)
+	for numWorkers != expectedWorkers {
+		time.Sleep(time.Second)
+		o, err := exec.Command("/bin/sh", "-c", "pgrep worker | wc -l").Output()
+		if err != nil {
+			klog.ErrorS(err, numWorkers)
+			return
+		}
+		// cleanup any non-printable chars from shell output
+		numWorkers = strings.Map(func(r rune) rune {
+			if unicode.IsPrint(r) {
+				return r
+			}
+			return -1
+		}, string(o))
+
+		klog.V(3).Infof("Currently running nginx worker processes: %s, expected %s", numWorkers, expectedWorkers)
+	}
 }
 
 // nginxHashBucketSize computes the correct NGINX hash_bucket_size for a hash
@@ -781,7 +832,11 @@ func (n *NGINXController) setupSSLProxy() {
 		klog.Fatalf("%v", err)
 	}
 
-	proxyList := &proxyproto.Listener{Listener: listener, ProxyHeaderTimeout: cfg.ProxyProtocolHeaderTimeout}
+	proxyList := &proxyproto.Listener{
+		Listener:          listener,
+		ReadHeaderTimeout: cfg.ProxyProtocolHeaderTimeout,
+		ReadBufferSize:    4096, // cf #14489
+	}
 
 	// accept TCP connections on the configured HTTPS port
 	go func() {
@@ -1033,14 +1088,40 @@ func createOpentelemetryCfg(cfg *ngx_config.Configuration) error {
 	return os.WriteFile(cfg.OpentelemetryConfig, tmplBuf.Bytes(), file.ReadWriteByUser)
 }
 
+func (n *NGINXController) createLuaConfig(cfg *ngx_config.Configuration) error {
+	luaconfigs := &ngx_template.LuaConfig{
+		EnableMetrics: n.cfg.EnableMetrics,
+		ListenPorts: ngx_template.LuaListenPorts{
+			HTTPSPort:    strconv.Itoa(n.cfg.ListenPorts.HTTPS),
+			StatusPort:   strconv.Itoa(nginx.StatusPort),
+			SSLProxyPort: strconv.Itoa(n.cfg.ListenPorts.SSLProxy),
+		},
+		UseProxyProtocol:        cfg.UseProxyProtocol,
+		UseForwardedHeaders:     cfg.UseForwardedHeaders,
+		IsSSLPassthroughEnabled: n.cfg.EnableSSLPassthrough,
+		HTTPRedirectCode:        cfg.HTTPRedirectCode,
+		EnableOCSP:              cfg.EnableOCSP,
+		MonitorBatchMaxSize:     n.cfg.MonitorMaxBatchSize,
+		HSTS:                    cfg.HSTS,
+		HSTSMaxAge:              cfg.HSTSMaxAge,
+		HSTSIncludeSubdomains:   cfg.HSTSIncludeSubdomains,
+		HSTSPreload:             cfg.HSTSPreload,
+	}
+	jsonCfg, err := json.Marshal(luaconfigs)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(luaCfgPath, jsonCfg, file.ReadWriteByUser)
+}
+
 func cleanTempNginxCfg() error {
 	var files []string
 
-	err := filepath.Walk(os.TempDir(), func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(filepath.Join(os.TempDir(), "nginx"), func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() && os.TempDir() != path {
+		if info.IsDir() && path != filepath.Join(os.TempDir(), "nginx") {
 			return filepath.SkipDir
 		}
 
@@ -1059,7 +1140,7 @@ func cleanTempNginxCfg() error {
 	}
 
 	for _, file := range files {
-		err := os.Remove(file)
+		err = os.Remove(file)
 		if err != nil {
 			return err
 		}

@@ -133,7 +133,7 @@ var _ = framework.IngressNginxDescribe("[TCP] tcp-services", func() {
 		// Execute the test. Use the `external name` service to resolve a domain name.
 		resolver := net.Resolver{
 			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				d := net.Dialer{}
 				return d.DialContext(ctx, "tcp", fmt.Sprintf("%v:5353", ip))
 			},
@@ -157,8 +157,7 @@ var _ = framework.IngressNginxDescribe("[TCP] tcp-services", func() {
 
 			return false, nil
 		})
-		//nolint:staticcheck // TODO: will replace it since wait.ErrWaitTimeout is deprecated
-		if err == wait.ErrWaitTimeout {
+		if err != nil && errRetry != nil {
 			err = errRetry
 		}
 

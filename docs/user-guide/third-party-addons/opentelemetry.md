@@ -42,7 +42,7 @@ otlp-collector-host: "otel-coll-collector.otel.svc"
 NOTE: While the option is called `otlp-collector-host`, you will need to point this to any backend that receives otlp-grpc.
 
 Next you will need to deploy a distributed telemetry system which uses OpenTelemetry.
-[opentelemetry-collector](https://github.com/open-telemetry/opentelemetry-collector), [Jaeger](https://www.jaegertracing.io/)
+[opentelemetry-collector](https://github.com/open-telemetry/opentelemetry-collector), [Jaeger](https://www.jaegertracing.io/),
 [Tempo](https://github.com/grafana/tempo), and [zipkin](https://zipkin.io/)
 have been tested.
 
@@ -51,7 +51,7 @@ Other optional configuration options:
 # specifies the name to use for the server span
 opentelemetry-operation-name
 
-# sets whether or not to trust incoming telemetry spans
+# sets whether or not to trust incoming telemetry spans, Default: true
 opentelemetry-trust-incoming-span
 
 # specifies the port to use when uploading traces, Default: 4317
@@ -60,26 +60,23 @@ otlp-collector-port
 # specifies the service name to use for any traces created, Default: nginx
 otel-service-name
 
-# The maximum queue size. After the size is reached data are dropped.
+# The maximum queue size. After the size is reached data are dropped, Default: 2048
 otel-max-queuesize
 
-# The delay interval in milliseconds between two consecutive exports.
-otel-schedule-delay-millis
-        
-# How long the export can run before it is cancelled.
+# The delay interval in milliseconds between two consecutive exports, Default: 5000
 otel-schedule-delay-millis
 
-# The maximum batch size of every export. It must be smaller or equal to maxQueueSize.
+# The maximum batch size of every export. It must be smaller or equal to maxQueueSize, Default: 512
 otel-max-export-batch-size
 
 # specifies sample rate for any traces created, Default: 0.01
 otel-sampler-ratio
 
 # specifies the sampler to be used when sampling traces.
-# The available samplers are: AlwaysOn,  AlwaysOff, TraceIdRatioBased, Default: AlwaysOff
+# The available samplers are: AlwaysOn,  AlwaysOff, TraceIdRatioBased, Default: AlwaysOn
 otel-sampler
 
-# Uses sampler implementation which by default will take a sample if parent Activity is sampled, Default: false
+# Uses sampler implementation which by default will take a sample if parent Activity is sampled, Default: true
 otel-sampler-parent-based
 ```
 
@@ -112,7 +109,7 @@ graph TB
     end
 
     subgraph otel
-        otc["Otel Collector"] 
+        otc["Otel Collector"]
     end
 
     subgraph observability
@@ -147,17 +144,7 @@ graph TB
 
 To install the example and collectors run:
 
-1. Enable Ingress addon with:
-
-    ```yaml
-      opentelemetry:
-        enabled: true
-        image: registry.k8s.io/ingress-nginx/opentelemetry:v20230527@sha256:fd7ec835f31b7b37187238eb4fdad4438806e69f413a203796263131f4f02ed0
-        containerSecurityContext:
-        allowPrivilegeEscalation: false
-    ```
-
-2. Enable OpenTelemetry and set the otlp-collector-host:
+1. Enable OpenTelemetry and set the otlp-collector-host:
 
     ```yaml
     $ echo '
@@ -183,15 +170,15 @@ To install the example and collectors run:
       ' | kubectl replace -f -
     ```
 
-4. Deploy otel-collector, grafana and Jaeger backend:
+2. Deploy otel-collector, grafana and Jaeger backend:
 
     ```bash
     # add helm charts needed for grafana and OpenTelemetry collector
     helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
     helm repo add grafana https://grafana.github.io/helm-charts
     helm repo update
-    # deply cert-manager needed for OpenTelemetry collector operator
-    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.9.1/cert-manager.yaml
+    # deploy cert-manager needed for OpenTelemetry collector operator
+    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.3/cert-manager.yaml
     # create observability namespace
     kubectl apply -f https://raw.githubusercontent.com/esigo/nginx-example/main/observability/namespace.yaml
     # install OpenTelemetry collector operator
@@ -218,7 +205,7 @@ To install the example and collectors run:
     make deploy-app
     ```
 
-5. Make a few requests to the Service:
+4. Make a few requests to the Service:
 
     ```bash
     kubectl port-forward --namespace=ingress-nginx service/ingress-nginx-controller 8090:80
@@ -247,7 +234,7 @@ To install the example and collectors run:
     RawContentLength  : 21
     ```
 
-6. View the Grafana UI:
+5. View the Grafana UI:
 
     ```bash
     kubectl port-forward --namespace=observability service/grafana 3000:80
@@ -255,7 +242,7 @@ To install the example and collectors run:
     In the Grafana interface we can see the details:
     ![grafana screenshot](../../images/otel-grafana-demo.png "grafana screenshot")
 
-7. View the Jaeger UI:
+6. View the Jaeger UI:
 
     ```bash
     kubectl port-forward --namespace=observability service/jaeger-all-in-one-query 16686:16686
@@ -263,7 +250,7 @@ To install the example and collectors run:
     In the Jaeger interface we can see the details:
     ![Jaeger screenshot](../../images/otel-jaeger-demo.png "Jaeger screenshot")
 
-8. View the Zipkin UI:
+7. View the Zipkin UI:
 
     ```bash
     kubectl port-forward --namespace=observability service/zipkin 9411:9411
@@ -279,10 +266,10 @@ for common annotations and configurations:
 
 ### Annotations
 
-| Legacy                                           | OpenTelemetry                                    |
-|--------------------------------------------------|--------------------------------------------------|
-| `nginx.ingress.kubernetes.io/enable-opentracing` | `nginx.ingress.kubernetes.io/enable-opentelemetry` |
-| `opentracing-trust-incoming-span`                | `opentracing-trust-incoming-span`                  |
+| Legacy                                                        | OpenTelemetry                                                   |
+|---------------------------------------------------------------|-----------------------------------------------------------------|
+| `nginx.ingress.kubernetes.io/enable-opentracing`              | `nginx.ingress.kubernetes.io/enable-opentelemetry`              |
+| `nginx.ingress.kubernetes.io/opentracing-trust-incoming-span` | `nginx.ingress.kubernetes.io/opentelemetry-trust-incoming-span` |
 
 ### Configs
 

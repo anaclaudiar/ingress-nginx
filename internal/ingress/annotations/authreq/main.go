@@ -18,6 +18,7 @@ package authreq
 
 import (
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 
@@ -243,14 +244,18 @@ func (e1 *Config) Equal(e2 *Config) bool {
 		return false
 	}
 
+	if !reflect.DeepEqual(e1.ProxySetHeaders, e2.ProxySetHeaders) {
+		return false
+	}
+
 	return sets.StringElementsMatch(e1.AuthCacheDuration, e2.AuthCacheDuration)
 }
 
 var (
-	methodsRegex    = regexp.MustCompile("(GET|HEAD|POST|PUT|PATCH|DELETE|CONNECT|OPTIONS|TRACE)")
+	methodsRegex    = regexp.MustCompile("^(GET|HEAD|POST|PUT|PATCH|DELETE|CONNECT|OPTIONS|TRACE)$")
 	headerRegexp    = regexp.MustCompile(`^[a-zA-Z\d\-_]+$`)
 	statusCodeRegex = regexp.MustCompile(`^\d{3}$`)
-	durationRegex   = regexp.MustCompile(`^\d+(ms|s|m|h|d|w|M|y)$`) // see http://nginx.org/en/docs/syntax.html
+	durationRegex   = regexp.MustCompile(`^\d+(ms|s|m|h|d|w|M|y)$`) // see https://nginx.org/en/docs/syntax.html
 )
 
 // ValidMethod checks is the provided string a valid HTTP method
@@ -416,7 +421,7 @@ func (a authReq) Parse(ing *networking.Ingress) (interface{}, error) {
 		harr := strings.Split(hstr, ",")
 		for _, header := range harr {
 			header = strings.TrimSpace(header)
-			if len(header) > 0 {
+			if header != "" {
 				if !ValidHeader(header) {
 					return nil, ing_errors.NewLocationDenied("invalid headers list")
 				}
@@ -505,7 +510,7 @@ func ParseStringToCacheDurations(input string) ([]string, error) {
 		arr := strings.Split(input, ",")
 		for _, duration := range arr {
 			duration = strings.TrimSpace(duration)
-			if len(duration) > 0 {
+			if duration != "" {
 				if !ValidCacheDuration(duration) {
 					authCacheDuration = []string{DefaultCacheDuration}
 					return authCacheDuration, ing_errors.NewLocationDenied(fmt.Sprintf("invalid cache duration: %s", duration))

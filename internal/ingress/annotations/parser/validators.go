@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -44,11 +45,13 @@ var (
 	alphaNumericChars    = `\-\.\_\~a-zA-Z0-9\/:`
 	extendedAlphaNumeric = alphaNumericChars + ", "
 	regexEnabledChars    = regexp.QuoteMeta(`^$[](){}*+?|&=\`)
-	urlEnabledChars      = regexp.QuoteMeta(`:?&=`)
+	urlEnabledChars      = regexp.QuoteMeta(`,:?&=`)
 )
 
 // IsValidRegex checks if the tested string can be used as a regex, but without any weird character.
 // It includes regex characters for paths that may contain regexes
+//
+//nolint:goconst //already a constant
 var IsValidRegex = regexp.MustCompile("^[/" + alphaNumericChars + regexEnabledChars + "]*$")
 
 // SizeRegex validates sizes understood by NGINX, like 1000, 100k, 1000M
@@ -77,6 +80,8 @@ var (
 	// URLWithNginxVariableRegex defines a url that can contain nginx variables.
 	// It is a risky operation
 	URLWithNginxVariableRegex = regexp.MustCompile("^[" + extendedAlphaNumeric + urlEnabledChars + "$]*$")
+	// MaliciousRegex defines chars that are known to inject RCE
+	MaliciousRegex = regexp.MustCompile(`\r|\n`)
 )
 
 // ValidateArrayOfServerName validates if all fields on a Server name annotation are
@@ -111,8 +116,26 @@ func ValidateRegex(regex *regexp.Regexp, removeSpace bool) AnnotationValidator {
 		if !regex.MatchString(s) {
 			return fmt.Errorf("value %s is invalid", s)
 		}
+		if MaliciousRegex.MatchString(s) {
+			return fmt.Errorf("value %s contains malicious string", s)
+		}
+
 		return nil
 	}
+}
+
+// CommonNameAnnotationValidator checks whether the annotation value starts with
+// 'CN=' and is followed by a valid regex.
+func CommonNameAnnotationValidator(s string) error {
+	if !strings.HasPrefix(s, "CN=") {
+		return fmt.Errorf("value %s is not a valid Common Name annotation: missing prefix 'CN='", s)
+	}
+
+	if _, err := regexp.Compile(s[3:]); err != nil {
+		return fmt.Errorf("value %s is not a valid regex: %w", s, err)
+	}
+
+	return nil
 }
 
 // ValidateOptions receives an array of valid options that can be the value of annotation.
@@ -174,7 +197,7 @@ func ValidateServiceName(value string) error {
 	return nil
 }
 
-// checkAnnotations will check each annotation for:
+// checkAnnotation will check each annotation for:
 // 1 - Does it contain the internal validation and docs config?
 // 2 - Does the ingress contains annotations? (validate null pointers)
 // 3 - Does it contains a validator? Should it contain a validator (not containing is a bug!)
@@ -231,8 +254,12 @@ func CheckAnnotationRisk(annotations map[string]string, maxrisk AnnotationRisk, 
 	var err error
 	for annotation := range annotations {
 		annPure := TrimAnnotationPrefix(annotation)
-		if cfg, ok := config[annPure]; ok && cfg.Risk > maxrisk {
-			err = errors.Join(err, fmt.Errorf("annotation %s is too risky for environment", annotation))
+		// We need to iterate through the map as we need to consider annotation aliases which are part of the value.
+		for key, cfg := range config {
+			// Check if either the key or any alias equals the annotation and the risk is higher than allowed.
+			if (key == annPure || slices.Contains(cfg.AnnotationAliases, annPure)) && cfg.Risk > maxrisk {
+				err = errors.Join(err, fmt.Errorf("annotation %s is too risky for environment", annotation))
+			}
 		}
 	}
 	return err

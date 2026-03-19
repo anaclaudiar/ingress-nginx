@@ -37,12 +37,12 @@ var _ = framework.IngressNginxDescribe("[Shutdown] ingress controller", func() {
 		f.NewSlowEchoDeployment()
 	})
 
-	ginkgo.It("should shutdown in less than 60 secons without pending connections", func() {
+	ginkgo.It("should shutdown in less than 60 seconds without pending connections", func() {
 		f.EnsureIngress(framework.NewSingleIngress(host, "/", host, f.Namespace, framework.SlowEchoService, 80, nil))
 
 		f.WaitForNginxServer(host,
 			func(server string) bool {
-				return strings.Contains(server, "server_name shutdown")
+				return strings.Contains(server, `server_name "shutdown"`)
 			})
 
 		f.HTTPTestClient().
@@ -77,7 +77,7 @@ var _ = framework.IngressNginxDescribe("[Shutdown] ingress controller", func() {
 
 		f.WaitForNginxServer(host,
 			func(server string) bool {
-				return strings.Contains(server, "server_name shutdown")
+				return strings.Contains(server, `server_name "shutdown"`)
 			})
 
 		startTime := time.Now()
@@ -122,7 +122,7 @@ var _ = framework.IngressNginxDescribe("[Shutdown] ingress controller", func() {
 
 		f.WaitForNginxServer(host,
 			func(server string) bool {
-				return strings.Contains(server, "server_name shutdown")
+				return strings.Contains(server, `server_name "shutdown"`)
 			})
 
 		startTime := time.Now()

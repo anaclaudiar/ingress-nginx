@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -27,6 +28,8 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/operation"
+	"k8s.io/apimachinery/pkg/api/validate"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -91,6 +94,7 @@ type Configuration struct {
 	UpdateStatus           bool
 	UseNodeInternalIP      bool
 	ElectionID             string
+	ElectionTTL            time.Duration
 	UpdateStatusOnShutdown bool
 
 	HealthCheckHost string
@@ -100,13 +104,18 @@ type Configuration struct {
 
 	EnableSSLPassthrough bool
 
+	DisableLeaderElection bool
+
 	EnableProfiling bool
 
-	EnableMetrics        bool
-	MetricsPerHost       bool
-	MetricsBuckets       *collectors.HistogramBuckets
-	ReportStatusClasses  bool
-	ExcludeSocketMetrics []string
+	EnableMetrics           bool
+	MetricsPerHost          bool
+	MetricsPerUndefinedHost bool
+	MetricsBuckets          *collectors.HistogramBuckets
+	MetricsBucketFactor     float64
+	MetricsMaxBuckets       uint32
+	ReportStatusClasses     bool
+	ExcludeSocketMetrics    []string
 
 	FakeCertificate *ingress.SSLCert
 
@@ -150,6 +159,13 @@ func getIngressPodZone(svc *apiv1.Service) string {
 			}
 		}
 	}
+	if svc.Spec.TrafficDistribution != nil && *svc.Spec.TrafficDistribution == apiv1.ServiceTrafficDistributionPreferClose {
+		if foundZone, ok := k8s.IngressNodeDetails.GetLabels()[apiv1.LabelTopologyZone]; ok {
+			klog.V(3).Infof("Svc has traffic distribution enabled, try to use zone %q where controller pod is running for Service %q ", foundZone, svcKey)
+			return foundZone
+		}
+	}
+
 	return emptyZone
 }
 
@@ -179,7 +195,18 @@ func (n *NGINXController) syncIngress(interface{}) error {
 	n.metricCollector.SetSSLExpireTime(servers)
 	n.metricCollector.SetSSLInfo(servers)
 
+	hash, err := hashstructure.Hash(pcfg, hashstructure.FormatV1, &hashstructure.HashOptions{
+		TagName: "json",
+	})
+	if err != nil {
+		klog.Errorf("unexpected error hashing configuration: %v", err)
+	}
+
 	if n.runningConfig.Equal(pcfg) {
+		if !n.lastConfigSuccess {
+			n.metricCollector.ConfigSuccess(hash, true)
+			n.lastConfigSuccess = true
+		}
 		klog.V(3).Infof("No configuration change detected, skipping backend reload")
 		return nil
 	}
@@ -189,19 +216,13 @@ func (n *NGINXController) syncIngress(interface{}) error {
 	if !utilingress.IsDynamicConfigurationEnough(pcfg, n.runningConfig) {
 		klog.InfoS("Configuration changes detected, backend reload required")
 
-		hash, err := hashstructure.Hash(pcfg, hashstructure.FormatV1, &hashstructure.HashOptions{
-			TagName: "json",
-		})
-		if err != nil {
-			klog.Errorf("unexpected error hashing configuration: %v", err)
-		}
-
 		pcfg.ConfigurationChecksum = fmt.Sprintf("%v", hash)
 
 		err = n.OnUpdate(*pcfg)
 		if err != nil {
 			n.metricCollector.IncReloadErrorCount()
 			n.metricCollector.ConfigSuccess(hash, false)
+			n.lastConfigSuccess = false
 			klog.Errorf("Unexpected failure reloading the backend:\n%v", err)
 			n.recorder.Eventf(k8s.IngressPodDetails, apiv1.EventTypeWarning, "RELOAD", fmt.Sprintf("Error reloading NGINX: %v", err))
 			return err
@@ -210,6 +231,7 @@ func (n *NGINXController) syncIngress(interface{}) error {
 		klog.InfoS("Backend successfully reloaded")
 		n.metricCollector.ConfigSuccess(hash, true)
 		n.metricCollector.IncReloadCount()
+		n.lastConfigSuccess = true
 
 		n.recorder.Eventf(k8s.IngressPodDetails, apiv1.EventTypeNormal, "RELOAD", "NGINX reload triggered due to a change in configuration")
 	}
@@ -230,7 +252,7 @@ func (n *NGINXController) syncIngress(interface{}) error {
 	}
 
 	retriesRemaining := retry.Steps
-	err := wait.ExponentialBackoff(retry, func() (bool, error) {
+	err = wait.ExponentialBackoff(retry, func() (bool, error) {
 		err := n.configureDynamically(pcfg)
 		if err == nil {
 			klog.V(2).Infof("Dynamic reconfiguration succeeded.")
@@ -250,9 +272,8 @@ func (n *NGINXController) syncIngress(interface{}) error {
 	}
 
 	ri := utilingress.GetRemovedIngresses(n.runningConfig, pcfg)
-	re := utilingress.GetRemovedHosts(n.runningConfig, pcfg)
 	rc := utilingress.GetRemovedCertificateSerialNumbers(n.runningConfig, pcfg)
-	n.metricCollector.RemoveMetrics(ri, re, rc)
+	n.metricCollector.RemoveMetrics(ri, rc)
 
 	n.runningConfig = pcfg
 
@@ -344,6 +365,12 @@ func (n *NGINXController) CheckIngress(ing *networking.Ingress) error {
 	cfg := n.store.GetBackendConfiguration()
 	cfg.Resolver = n.resolver
 
+	// Validate UID
+	// The only argument that matters is ing.UID.
+	if err := validate.UUID(context.TODO(), operation.Operation{}, nil, &ing.UID, nil); err != nil {
+		return fmt.Errorf("ingress has invalid UID: %v", err)
+	}
+
 	// Adds the pathType Validation
 	if cfg.StrictValidatePathType {
 		if err := inspector.ValidatePathType(ing); err != nil {
@@ -374,10 +401,6 @@ func (n *NGINXController) CheckIngress(ing *networking.Ingress) error {
 
 		if !cfg.AllowSnippetAnnotations && strings.HasSuffix(key, "-snippet") {
 			return fmt.Errorf("%s annotation cannot be used. Snippet directives are disabled by the Ingress administrator", key)
-		}
-
-		if cfg.GlobalRateLimitMemcachedHost == "" && strings.HasPrefix(key, fmt.Sprintf("%s/%s", parser.AnnotationsPrefix, "global-rate-limit")) {
-			return fmt.Errorf("'global-rate-limit*' annotations require 'global-rate-limit-memcached-host' settings configured in the global configmap")
 		}
 	}
 
@@ -419,11 +442,15 @@ func (n *NGINXController) CheckIngress(ing *networking.Ingress) error {
 		return err
 	}
 
+	/* Deactivated to mitigate CVE-2025-1974
+	// TODO: Implement sandboxing so this test can be done safely
 	err = n.testTemplate(content)
 	if err != nil {
 		n.metricCollector.IncCheckErrorCount(ing.ObjectMeta.Namespace, ing.Name)
 		return err
 	}
+	*/
+
 	n.metricCollector.IncCheckCount(ing.ObjectMeta.Namespace, ing.Name)
 	endCheck := time.Now().UnixNano() / 1000000
 	n.metricCollector.SetAdmissionMetrics(
@@ -1254,6 +1281,7 @@ func (n *NGINXController) createServers(data []*ingress.Ingress,
 		ReadTimeout:          bdef.ProxyReadTimeout,
 		BuffersNumber:        bdef.ProxyBuffersNumber,
 		BufferSize:           bdef.ProxyBufferSize,
+		BusyBuffersSize:      bdef.ProxyBusyBuffersSize,
 		CookieDomain:         bdef.ProxyCookieDomain,
 		CookiePath:           bdef.ProxyCookiePath,
 		NextUpstream:         bdef.ProxyNextUpstream,
@@ -1403,6 +1431,10 @@ func (n *NGINXController) createServers(data []*ingress.Ingress,
 				}
 			}
 
+			if !servers[host].SSLPassthrough && anns.SSLPassthrough {
+				servers[host].SSLPassthrough = true
+			}
+
 			// only add SSL ciphers if the server does not have them previously configured
 			if servers[host].SSLCiphers == "" && anns.SSLCipher.SSLCiphers != "" {
 				servers[host].SSLCiphers = anns.SSLCipher.SSLCiphers
@@ -1502,6 +1534,7 @@ func (n *NGINXController) createServers(data []*ingress.Ingress,
 func locationApplyAnnotations(loc *ingress.Location, anns *annotations.Ingress) {
 	loc.BasicDigestAuth = anns.BasicDigestAuth
 	loc.ClientBodyBufferSize = anns.ClientBodyBufferSize
+	loc.CustomHeaders = anns.CustomHeaders
 	loc.ConfigurationSnippet = anns.ConfigurationSnippet
 	loc.CorsConfig = anns.CorsConfig
 	loc.ExternalAuth = anns.ExternalAuth
@@ -1511,7 +1544,6 @@ func locationApplyAnnotations(loc *ingress.Location, anns *annotations.Ingress) 
 	loc.Proxy = anns.Proxy
 	loc.ProxySSL = anns.ProxySSL
 	loc.RateLimit = anns.RateLimit
-	loc.GlobalRateLimit = anns.GlobalRateLimit
 	loc.Redirect = anns.Redirect
 	loc.Rewrite = anns.Rewrite
 	loc.UpstreamVhost = anns.UpstreamVhost
@@ -1591,7 +1623,11 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 			altEqualsPri := false
 
 			for _, loc := range servers[defServerName].Locations {
-				priUps := upstreams[loc.Backend]
+				priUps, ok := upstreams[loc.Backend]
+				if !ok {
+					klog.Warningf("cannot find primary backend %s for location %s%s", loc.Backend, servers[defServerName].Hostname, loc.Path)
+					continue
+				}
 				altEqualsPri = altUps.Name == priUps.Name
 				if altEqualsPri {
 					klog.Warningf("alternative upstream %s in Ingress %s/%s is primary upstream in Other Ingress for location %s%s!",
@@ -1650,7 +1686,11 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 
 			// find matching paths
 			for _, loc := range server.Locations {
-				priUps := upstreams[loc.Backend]
+				priUps, ok := upstreams[loc.Backend]
+				if !ok {
+					klog.Warningf("cannot find primary backend %s for location %s%s", loc.Backend, server.Hostname, loc.Path)
+					continue
+				}
 				altEqualsPri = altUps.Name == priUps.Name
 				if altEqualsPri {
 					klog.Warningf("alternative upstream %s in Ingress %s/%s is primary upstream in Other Ingress for location %s%s!",
@@ -1807,16 +1847,14 @@ func checkOverlap(ing *networking.Ingress, servers []*ingress.Server) error {
 				continue
 			}
 
-			// same ingress
-			for _, existing := range existingIngresses {
-				if existing.ObjectMeta.Namespace == ing.ObjectMeta.Namespace && existing.ObjectMeta.Name == ing.ObjectMeta.Name {
-					return nil
-				}
-			}
-
 			// path overlap. Check if one of the ingresses has a canary annotation
 			isCanaryEnabled, annotationErr := parser.GetBoolAnnotation("canary", ing, canary.CanaryAnnotations.Annotations)
 			for _, existing := range existingIngresses {
+				if existing.ObjectMeta.Namespace == ing.ObjectMeta.Namespace && existing.ObjectMeta.Name == ing.ObjectMeta.Name {
+					// same ingress
+					continue
+				}
+
 				isExistingCanaryEnabled, existingAnnotationErr := parser.GetBoolAnnotation("canary", existing, canary.CanaryAnnotations.Annotations)
 
 				if isCanaryEnabled && isExistingCanaryEnabled {
@@ -1829,7 +1867,6 @@ func checkOverlap(ing *networking.Ingress, servers []*ingress.Server) error {
 			}
 
 			// no overlap
-			return nil
 		}
 	}
 

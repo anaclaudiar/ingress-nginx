@@ -34,6 +34,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"k8s.io/ingress-nginx/test/e2e/framework"
@@ -47,12 +48,15 @@ var _ = framework.DescribeSetting("OCSP", func() {
 	})
 
 	ginkgo.It("should enable OCSP and contain stapling information in the connection", func() {
-		ginkgo.Skip("Skipped due to a bug with cfssl and Alpine")
 		host := "www.example.com"
 
 		f.UpdateNginxConfigMapData("enable-ocsp", "true")
 
 		err := prepareCertificates(f.Namespace)
+		if err != nil {
+			ginkgo.By(fmt.Sprintf("Prepare Certs error %v", err.Error()))
+		}
+
 		assert.Nil(ginkgo.GinkgoT(), err)
 
 		ing := framework.NewSingleIngressWithTLS(host, "/", host, []string{host}, f.Namespace, framework.EchoService, 80, nil)
@@ -104,13 +108,14 @@ var _ = framework.DescribeSetting("OCSP", func() {
 		err = framework.WaitForEndpoints(f.KubeClientSet, framework.DefaultTimeout, "ocspserve", f.Namespace, 1)
 		assert.Nil(ginkgo.GinkgoT(), err, "waiting for endpoints to become ready")
 
-		f.WaitForNginxConfiguration(func(cfg string) bool {
-			return strings.Contains(cfg, "certificate.is_ocsp_stapling_enabled = true")
+		f.WaitForLuaConfiguration(func(jsonCfg map[string]interface{}) bool {
+			val, ok, err := unstructured.NestedBool(jsonCfg, "enable_ocsp")
+			return err == nil && ok && val
 		})
 
 		f.WaitForNginxServer(host,
 			func(server string) bool {
-				return strings.Contains(server, fmt.Sprintf(`server_name %v`, host))
+				return strings.Contains(server, fmt.Sprintf(`server_name "%v"`, host))
 			})
 
 		tlsConfig := &tls.Config{ServerName: host, InsecureSkipVerify: true} //nolint:gosec // Ignore the gosec error in testing
@@ -292,7 +297,7 @@ func ocspserveDeployment(namespace string) (*appsv1.Deployment, *corev1.Service)
 						Containers: []corev1.Container{
 							{
 								Name:  name,
-								Image: "registry.k8s.io/ingress-nginx/e2e-test-cfssl@sha256:adaa118c179c41cb33fb567004a1f0c71b8fce6bc13263efa63d42dddd5b4346",
+								Image: "registry.k8s.io/ingress-nginx/cfssl:v1.2.9@sha256:40abba2d26b5aba72bd40bbadde1a00eabf6dfbd7111c7dd40ebe0281e70bb93",
 								Command: []string{
 									"/bin/bash",
 									"-c",

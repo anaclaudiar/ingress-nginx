@@ -36,7 +36,7 @@ var keyFunc = cache.DeletionHandlingMetaNamespaceKeyFunc
 // which timestamp is older than the last successful get operation.
 type Queue struct {
 	// queue is the work queue the worker polls
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[any]
 	// sync is called for each item in the queue
 	sync func(interface{}) error
 	// workerDone is closed when the worker exits
@@ -120,10 +120,16 @@ func (t *Queue) worker() {
 			klog.ErrorS(nil, "invalid item type", "key", key)
 		}
 		if item.Timestamp != 0 && t.lastSync > item.Timestamp {
-			klog.V(3).InfoS("skipping sync", "key", item.Key, "last", t.lastSync, "now", item.Timestamp)
-			t.queue.Forget(key)
-			t.queue.Done(key)
-			continue
+			// fix issue https://github.com/kubernetes/ingress-nginx/issues/14374
+			if t.lastSync > ts {
+				klog.Warningf("The lastSync time %d is later than the current time %d; setting lastSync to %d", t.lastSync, ts, item.Timestamp)
+				t.lastSync = item.Timestamp
+			} else {
+				klog.V(3).InfoS("skipping sync", "key", item.Key, "last", t.lastSync, "now", item.Timestamp)
+				t.queue.Forget(key)
+				t.queue.Done(key)
+				continue
+			}
 		}
 
 		klog.V(3).InfoS("syncing", "key", item.Key)
@@ -172,7 +178,7 @@ func NewTaskQueue(syncFn func(interface{}) error) *Queue {
 // NewCustomTaskQueue creates a new custom task queue with the given sync function.
 func NewCustomTaskQueue(syncFn func(interface{}) error, fn func(interface{}) (interface{}, error)) *Queue {
 	q := &Queue{
-		queue:      workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		queue:      workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any]()),
 		sync:       syncFn,
 		workerDone: make(chan bool),
 		fn:         fn,

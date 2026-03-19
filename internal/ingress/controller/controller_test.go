@@ -38,6 +38,7 @@ import (
 	networking "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"k8s.io/ingress-nginx/pkg/apis/ingress"
@@ -63,6 +64,7 @@ import (
 const (
 	exampleBackend = "example-http-svc-1-80"
 	TRUE           = "true"
+	goodUID        = "467a2005-a207-40f8-a15d-fd30b8ecfe94"
 )
 
 type fakeIngressStore struct {
@@ -170,7 +172,7 @@ func (fakeTemplate) Write(conf *ngx_config.TemplateConfig) ([]byte, error) {
 
 func TestCheckIngress(t *testing.T) {
 	defer func() {
-		err := filepath.Walk(os.TempDir(), func(path string, info os.FileInfo, err error) error {
+		err := filepath.Walk(os.TempDir(), func(path string, info os.FileInfo, _ error) error {
 			if info.IsDir() && os.TempDir() != path {
 				return filepath.SkipDir
 			}
@@ -219,8 +221,42 @@ func TestCheckIngress(t *testing.T) {
 			},
 		},
 	}
+
+	t.Run("when uids are invalid", func(t *testing.T) {
+		invalidUIDs := []string{
+			"invalid_uid!@#$%",
+			"invalid_uid!",
+			"12345-67890-xyz", // xyz are not valid hex characters
+			"12345 67890",     // spaces not allowed
+			"",
+			"urn:uuid:12345-67890-xyz", // xyz are not valid hex characters
+			"urn:uud:12345-67890-xyz",
+			"urn:uuid:12345 ",
+		}
+		for _, uid := range invalidUIDs {
+			ing.UID = types.UID(uid)
+			if nginx.CheckIngress(ing) == nil {
+				t.Errorf("with an invalid uid %s, an error should be returned", uid)
+			}
+		}
+	})
+
+	t.Run("when uids are valid", func(t *testing.T) {
+		validUIDs := []string{
+			"467a2005-a207-40f8-a15d-fd30b8ecfe94",
+			"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+		}
+		for _, uid := range validUIDs {
+			ing.UID = types.UID(uid)
+			if nginx.CheckIngress(ing) != nil {
+				t.Errorf("with a valid uid %s, no error should be returned", uid)
+			}
+		}
+	})
+
 	t.Run("when the class is the nginx one", func(t *testing.T) {
 		ing.ObjectMeta.Annotations["kubernetes.io/ingress.class"] = "nginx"
+		ing.UID = goodUID
 		nginx.command = testNginxTestCommand{
 			t:        t,
 			err:      nil,
@@ -240,6 +276,7 @@ func TestCheckIngress(t *testing.T) {
 				},
 			}
 			ing.Spec.Rules[0].Host = "test.example.com"
+			ing.UID = goodUID
 			nginx.command = testNginxTestCommand{
 				t:        t,
 				err:      nil,
@@ -250,6 +287,8 @@ func TestCheckIngress(t *testing.T) {
 			}
 		})
 
+		/* Deactivated to mitigate CVE-2025-1974
+		// TODO: Implement sandboxing so this test can be done safely
 		t.Run("When nginx test returns an error", func(t *testing.T) {
 			nginx.command = testNginxTestCommand{
 				t:        t,
@@ -261,6 +300,7 @@ func TestCheckIngress(t *testing.T) {
 				t.Errorf("with a new ingress with an error, an error should be returned")
 			}
 		})
+		*/
 
 		t.Run("When the default annotation prefix is used despite an override", func(t *testing.T) {
 			defer func() {
@@ -306,6 +346,7 @@ func TestCheckIngress(t *testing.T) {
 				err: nil,
 			}
 			ing.ObjectMeta.Annotations["nginx.ingress.kubernetes.io/custom-headers"] = "invalid_directive"
+			ing.UID = goodUID
 			if err := nginx.CheckIngress(ing); err == nil {
 				t.Errorf("with an invalid value in annotation the ingress should be rejected")
 			}
@@ -1292,6 +1333,74 @@ func TestMergeAlternativeBackends(t *testing.T) {
 				},
 			},
 		},
+		"alternative backend does not merge for missing upstream": {
+			&ingress.Ingress{
+				Ingress: networking.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "example",
+					},
+					Spec: networking.IngressSpec{
+						Rules: []networking.IngressRule{
+							{
+								Host: "example.com",
+								IngressRuleValue: networking.IngressRuleValue{
+									HTTP: &networking.HTTPIngressRuleValue{
+										Paths: []networking.HTTPIngressPath{
+											{
+												Path:     "/",
+												PathType: &pathTypePrefix,
+												Backend: networking.IngressBackend{
+													Service: &networking.IngressServiceBackend{
+														Name: "http-svc-canary",
+														Port: networking.ServiceBackendPort{
+															Number: 80,
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			map[string]*ingress.Backend{
+				"example-http-svc-canary-80": {
+					Name:     "example-http-svc-canary-80",
+					NoServer: true,
+					TrafficShapingPolicy: ingress.TrafficShapingPolicy{
+						Weight: 20,
+					},
+				},
+			},
+			map[string]*ingress.Server{
+				"example.com": {
+					Hostname: "example.com",
+					Locations: []*ingress.Location{
+						{
+							Path:     "/",
+							PathType: &pathTypePrefix,
+							Backend:  "example-http-svc-80",
+						},
+					},
+				},
+			},
+			map[string]*ingress.Backend{},
+			map[string]*ingress.Server{
+				"example.com": {
+					Hostname: "example.com",
+					Locations: []*ingress.Location{
+						{
+							Path:     "/",
+							PathType: &pathTypePrefix,
+							Backend:  "example-http-svc-80",
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for title, tc := range testCases {
@@ -1573,7 +1682,7 @@ func TestGetBackendServers(t *testing.T) {
 					},
 				},
 			},
-			Validate: func(ingresses []*ingress.Ingress, upstreams []*ingress.Backend, servers []*ingress.Server) {
+			Validate: func(_ []*ingress.Ingress, _ []*ingress.Backend, servers []*ingress.Server) {
 				if len(servers) != 1 {
 					t.Errorf("servers count should be 1, got %d", len(servers))
 					return
@@ -1640,7 +1749,7 @@ func TestGetBackendServers(t *testing.T) {
 					},
 				},
 			},
-			Validate: func(ingresses []*ingress.Ingress, upstreams []*ingress.Backend, servers []*ingress.Server) {
+			Validate: func(_ []*ingress.Ingress, _ []*ingress.Backend, servers []*ingress.Server) {
 				if len(servers) != 1 {
 					t.Errorf("servers count should be 1, got %d", len(servers))
 					return
@@ -1700,7 +1809,7 @@ func TestGetBackendServers(t *testing.T) {
 					},
 				},
 			},
-			Validate: func(ingresses []*ingress.Ingress, upstreams []*ingress.Backend, servers []*ingress.Server) {
+			Validate: func(_ []*ingress.Ingress, _ []*ingress.Backend, servers []*ingress.Server) {
 				if len(servers) != 1 {
 					t.Errorf("servers count should be 1, got %d", len(servers))
 					return
@@ -1799,7 +1908,7 @@ func TestGetBackendServers(t *testing.T) {
 					},
 				},
 			},
-			Validate: func(ingresses []*ingress.Ingress, upstreams []*ingress.Backend, servers []*ingress.Server) {
+			Validate: func(_ []*ingress.Ingress, _ []*ingress.Backend, servers []*ingress.Server) {
 				if len(servers) != 2 {
 					t.Errorf("servers count should be 2, got %d", len(servers))
 					return
@@ -2059,7 +2168,7 @@ func TestGetBackendServers(t *testing.T) {
 					},
 				},
 			},
-			Validate: func(ingresses []*ingress.Ingress, upstreams []*ingress.Backend, servers []*ingress.Server) {
+			Validate: func(_ []*ingress.Ingress, upstreams []*ingress.Backend, servers []*ingress.Server) {
 				if len(servers) != 2 {
 					t.Errorf("servers count should be 2, got %d", len(servers))
 					return
@@ -2190,7 +2299,7 @@ func TestGetBackendServers(t *testing.T) {
 					},
 				},
 			},
-			Validate: func(ingresses []*ingress.Ingress, upstreams []*ingress.Backend, servers []*ingress.Server) {
+			Validate: func(ingresses []*ingress.Ingress, _ []*ingress.Backend, servers []*ingress.Server) {
 				if len(servers) != 2 {
 					t.Errorf("servers count should be 2, got %d", len(servers))
 					return
@@ -2298,7 +2407,7 @@ func TestGetBackendServers(t *testing.T) {
 					},
 				},
 			},
-			Validate: func(ingresses []*ingress.Ingress, upstreams []*ingress.Backend, servers []*ingress.Server) {
+			Validate: func(ingresses []*ingress.Ingress, _ []*ingress.Backend, servers []*ingress.Server) {
 				if len(servers) != 2 {
 					t.Errorf("servers count should be 2, got %d", len(servers))
 					return
@@ -2367,7 +2476,7 @@ func TestGetBackendServers(t *testing.T) {
 					},
 				},
 			},
-			Validate: func(ingresses []*ingress.Ingress, upstreams []*ingress.Backend, servers []*ingress.Server) {
+			Validate: func(_ []*ingress.Ingress, _ []*ingress.Backend, servers []*ingress.Server) {
 				if len(servers) != 2 {
 					t.Errorf("servers count should be 1, got %d", len(servers))
 					return
@@ -2437,7 +2546,7 @@ func TestGetBackendServers(t *testing.T) {
 					},
 				},
 			},
-			Validate: func(ingresses []*ingress.Ingress, upstreams []*ingress.Backend, servers []*ingress.Server) {
+			Validate: func(_ []*ingress.Ingress, _ []*ingress.Backend, servers []*ingress.Server) {
 				if len(servers) != 2 {
 					t.Errorf("servers count should be 2, got %d", len(servers))
 					return
@@ -2467,6 +2576,98 @@ func TestGetBackendServers(t *testing.T) {
 					},
 				}
 			},
+		},
+		{
+			Ingresses: []*ingress.Ingress{
+				{
+					Ingress: networking.Ingress{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "ssl-passthrough-1",
+							Namespace: "default",
+						},
+						Spec: networking.IngressSpec{
+							Rules: []networking.IngressRule{
+								{
+									Host: "example.com",
+									IngressRuleValue: networking.IngressRuleValue{
+										HTTP: &networking.HTTPIngressRuleValue{
+											Paths: []networking.HTTPIngressPath{
+												{
+													Path:     "/path1",
+													PathType: &pathTypePrefix,
+													Backend: networking.IngressBackend{
+														Service: &networking.IngressServiceBackend{
+															Name: "path1-svc",
+															Port: networking.ServiceBackendPort{
+																Number: 80,
+															},
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					ParsedAnnotations: &annotations.Ingress{
+						SSLPassthrough: false,
+					},
+				},
+				{
+					Ingress: networking.Ingress{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "ssl-passthrough-2",
+							Namespace: "default",
+							Annotations: map[string]string{
+								"nginx.ingress.kubernetes.io/ssl-passthrough": "true",
+							},
+						},
+						Spec: networking.IngressSpec{
+							Rules: []networking.IngressRule{
+								{
+									Host: "example.com",
+									IngressRuleValue: networking.IngressRuleValue{
+										HTTP: &networking.HTTPIngressRuleValue{
+											Paths: []networking.HTTPIngressPath{
+												{
+													Path:     "/",
+													PathType: &pathTypePrefix,
+													Backend: networking.IngressBackend{
+														Service: &networking.IngressServiceBackend{
+															Name: "path2-svc",
+															Port: networking.ServiceBackendPort{
+																Number: 443,
+															},
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					ParsedAnnotations: &annotations.Ingress{
+						SSLPassthrough: true,
+					},
+				},
+			},
+			Validate: func(_ []*ingress.Ingress, _ []*ingress.Backend, servers []*ingress.Server) {
+				if len(servers) != 2 {
+					t.Errorf("servers count should be 2, got %d", len(servers))
+					return
+				}
+
+				s := servers[1]
+
+				if !s.SSLPassthrough {
+					t.Errorf("ssl passthrough should be true, got false")
+				}
+			},
+			SetConfigMap: testConfigMap,
 		},
 	}
 

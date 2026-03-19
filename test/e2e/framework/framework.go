@@ -16,6 +16,7 @@ package framework
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -25,6 +26,7 @@ import (
 	"k8s.io/ingress-nginx/test/e2e/framework/httpexpect"
 
 	"github.com/onsi/ginkgo/v2"
+	ginkgotypes "github.com/onsi/ginkgo/v2/types"
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -99,7 +101,7 @@ func NewDefaultFramework(baseName string, opts ...func(*Framework)) *Framework {
 }
 
 // NewSimpleFramework makes a new framework that allows the usage of a namespace
-// for arbitraty tests.
+// for arbitrary tests.
 func NewSimpleFramework(baseName string, opts ...func(*Framework)) *Framework {
 	defer ginkgo.GinkgoRecover()
 
@@ -178,7 +180,7 @@ func (f *Framework) AfterEach() {
 		assert.Nil(ginkgo.GinkgoT(), err, "deleting IngressClass")
 	}(f.KubeClientSet, f.IngressClass)
 
-	if !ginkgo.CurrentSpecReport().Failed() {
+	if !ginkgo.CurrentSpecReport().Failed() || ginkgo.CurrentSpecReport().State.Is(ginkgotypes.SpecStateInterrupted) {
 		return
 	}
 
@@ -282,6 +284,15 @@ func (f *Framework) WaitForNginxConfiguration(matcher func(cfg string) bool) {
 	Sleep(1 * time.Second)
 }
 
+// WaitForLuaConfiguration waits until the nginx configuration contains a particular configuration
+// `cfg` passed to matcher is normalized by replacing all tabs and spaces with single space.
+func (f *Framework) WaitForLuaConfiguration(matcher func(jsonCfg map[string]interface{}) bool) {
+	//nolint:staticcheck // TODO: will replace it since wait.Poll is deprecated
+	err := wait.Poll(Poll, DefaultTimeout, f.matchLuaConditions(matcher))
+	assert.Nil(ginkgo.GinkgoT(), err, "waiting for nginx lua configuration condition/s")
+	Sleep(1 * time.Second)
+}
+
 // WaitForNginxCustomConfiguration waits until the nginx configuration given part (from, to) contains a particular configuration
 func (f *Framework) WaitForNginxCustomConfiguration(from, to string, matcher func(cfg string) bool) {
 	//nolint:staticcheck // TODO: will replace it since wait.Poll is deprecated
@@ -312,7 +323,7 @@ func (f *Framework) matchNginxConditions(name string, matcher func(cfg string) b
 			return false, nil
 		}
 
-		if klog.V(10).Enabled() && len(o) > 0 {
+		if klog.V(10).Enabled() && o != "" {
 			klog.InfoS("NGINX", "configuration", o)
 		}
 
@@ -325,6 +336,29 @@ func (f *Framework) matchNginxConditions(name string, matcher func(cfg string) b
 	}
 }
 
+func (f *Framework) matchLuaConditions(matcher func(jsonCfg map[string]interface{}) bool) wait.ConditionFunc {
+	return func() (bool, error) {
+		cmd := "cat /etc/nginx/lua/cfg.json"
+
+		o, err := f.ExecCommand(f.pod, cmd)
+		if err != nil {
+			return false, nil
+		}
+
+		if klog.V(10).Enabled() && o != "" {
+			klog.InfoS("Lua", "configuration", o)
+		}
+
+		luaConfig := make(map[string]interface{}) // Use unstructured so we can walk through JSON
+		if err := json.Unmarshal([]byte(o), &luaConfig); err != nil {
+			return false, err
+		}
+
+		// passes the lua interface to the function
+		return matcher(luaConfig), nil
+	}
+}
+
 func (f *Framework) matchNginxCustomConditions(from, to string, matcher func(cfg string) bool) wait.ConditionFunc {
 	return func() (bool, error) {
 		cmd := fmt.Sprintf("cat /etc/nginx/nginx.conf| awk '/%v/,/%v/'", from, to)
@@ -334,7 +368,7 @@ func (f *Framework) matchNginxCustomConditions(from, to string, matcher func(cfg
 			return false, nil
 		}
 
-		if klog.V(10).Enabled() && len(o) > 0 {
+		if klog.V(10).Enabled() && o != "" {
 			klog.InfoS("NGINX", "configuration", o)
 		}
 
@@ -380,6 +414,20 @@ func (f *Framework) SetNginxConfigMapData(cmData map[string]string) {
 	}
 
 	f.WaitForReload(fn)
+}
+
+// SetNginxConfigMapData sets ingress-nginx's nginx-ingress-controller configMap data
+func (f *Framework) AllowSnippetConfiguration() func() {
+	f.SetNginxConfigMapData(map[string]string{
+		"allow-snippet-annotations": "true",
+		"annotations-risk-level":    "Critical", // To enable snippet configurations
+	})
+	return func() {
+		f.SetNginxConfigMapData(map[string]string{
+			"allow-snippet-annotations": "false",
+			"annotations-risk-level":    "High",
+		})
+	}
 }
 
 // CreateConfigMap creates a new configmap in the current namespace
@@ -500,7 +548,7 @@ func (f *Framework) newHTTPTestClient(config *tls.Config, setIngressURL bool) *h
 		Transport: &http.Transport{
 			TLSClientConfig: config,
 		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}, httpexpect.NewAssertReporter())

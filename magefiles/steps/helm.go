@@ -18,16 +18,14 @@ package steps
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"strings"
 
 	semver "github.com/blang/semver/v4"
-	"github.com/helm/helm/pkg/chartutil"
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
-	yamlpath "github.com/vmware-labs/yaml-jsonpath/pkg/yamlpath"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
+	chartutil "helm.sh/helm/v4/pkg/chart/v2/util"
 
 	utils "k8s.io/ingress-nginx/magefiles/utils"
 )
@@ -104,60 +102,108 @@ func updateVersion(version string) {
 	utils.CheckIfError(err, "HELM Saving new Chart")
 }
 
-func updateChartReleaseNotes(releasesNotes []string) {
-	utils.Info("HELM Updating the Chart Release notes")
+func updateChartReleaseNotes(releaseNotes []string) {
+	utils.Info("HELM Updating chart release notes")
 	chart, err := chartutil.LoadChartfile(HelmChartPath)
-	utils.CheckIfError(err, "HELM Could not Load Chart to update release notes %s", HelmChartPath)
-	for i := range releasesNotes {
-		releasesNotes[i] = fmt.Sprintf("- %q", releasesNotes[i])
-	}
-	releaseNoteString := strings.Join(releasesNotes, "\n")
-	utils.Info("HELM Release note string %s", releaseNoteString)
-	chart.Annotations["artifacthub.io/changes"] = releaseNoteString
+	utils.CheckIfError(err, "HELM Failed to load chart manifest: %s", HelmChartPath)
+
+	releaseNotesBytes, err := yaml.Marshal(releaseNotes)
+	utils.CheckIfError(err, "HELM Failed to marshal release notes")
+
+	releaseNotesString := string(releaseNotesBytes)
+	utils.Info("HELM Chart release notes:\n%s", releaseNotesString)
+	chart.Annotations["artifacthub.io/changes"] = releaseNotesString
+
+	utils.Info("HELM Saving chart release notes")
 	err = chartutil.SaveChartfile(HelmChartPath, chart)
-	utils.CheckIfError(err, "HELM Saving updated release notes for Chart")
+	utils.CheckIfError(err, "HELM Failed to save chart manifest: %s", HelmChartPath)
 }
 
-// UpdateChartValue Updates the Helm ChartValue
-func (Helm) UpdateChartValue(key, value string) {
-	updateChartValue(key, value)
+// Updates a Helm chart value by path and value.
+func (Helm) UpdateChartValue(path, value string) {
+	updateChartValue(path, value)
 }
 
-func updateChartValue(key, value string) {
-	utils.Info("HELM Updating Chart %s %s:%s", HelmChartValues, key, value)
+// Updates a Helm chart value by path and value.
+func updateChartValue(path, value string) {
+	utils.Info("HELM Updating path %q to value %q in file %q", path, value, HelmChartValues)
 
-	// read current values.yaml
-	data, err := os.ReadFile(HelmChartValues)
-	utils.CheckIfError(err, "HELM Could not Load Helm Chart Values files %s", HelmChartValues)
+	// Read file.
+	file, err := os.ReadFile(HelmChartValues)
+	utils.CheckIfError(err, "HELM Failed to read file %q", HelmChartValues)
 
-	// var valuesStruct IngressChartValue
-	var n yaml.Node
-	utils.CheckIfError(yaml.Unmarshal(data, &n), "HELM Could not Unmarshal %s", HelmChartValues)
+	// Unmarshal values.
+	var values yaml.Node
+	err = yaml.Unmarshal(file, &values)
+	utils.CheckIfError(err, "HELM Failed to unmarshal values %q", HelmChartValues)
 
-	// update value
-	// keyParse := parsePath(key)
-	p, err := yamlpath.NewPath(key)
-	utils.CheckIfError(err, "HELM cannot create path")
+	// Variable to track if we updated the value in the values.
+	updated := false
 
-	q, err := p.Find(&n)
-	utils.CheckIfError(err, "HELM unexpected error finding path")
+	// Iterate nodes.
+	for _, node := range values.Content {
+		// Variable to track if we found the path in the values.
+		found := false
 
-	for _, i := range q {
-		utils.Info("HELM Found %s at %s", i.Value, key)
-		i.Value = value
-		utils.Info("HELM Updated %s at %s", i.Value, key)
+		// Split path into keys and iterate over them to find the node to update.
+		for _, key := range strings.Split(path, ".") {
+			// Reset found variable for each key, since it might happen a single key of a path is not a mapping or not found.
+			found = false
+
+			// Check if node is a mapping node.
+			if node.Kind != yaml.MappingNode {
+				break
+			}
+
+			// Iterate over mapping content to find the key.
+			// Each key and its value are stored in consecutive positions in the content slice, so we need to iterate with a step of 2.
+			for i := 0; i < len(node.Content); i += 2 {
+				// Check if the current key matches the desired key.
+				if node.Content[i].Value == key {
+					// If we found the key, we need to update the mapping variable to point to its value.
+					node = node.Content[i+1]
+					found = true
+					break
+				}
+			}
+
+			// Check if we found the key in the mapping.
+			if !found {
+				break
+			}
+		}
+
+		// Check if we found the path in the node.
+		if !found {
+			continue
+		}
+
+		// Update the value of the node.
+		node.SetString(value)
+		updated = true
 	}
 
-	//// write to file
-	var b bytes.Buffer
-	yamlEncoder := yaml.NewEncoder(&b)
-	yamlEncoder.SetIndent(2)
-	err = yamlEncoder.Encode(&n)
-	utils.CheckIfError(err, "HELM Could not Marshal new Values file")
-	err = os.WriteFile(HelmChartValues, b.Bytes(), 0o644)
-	utils.CheckIfError(err, "HELM Could not write new Values file to %s", HelmChartValues)
+	// Check if we updated the value in the values.
+	if !updated {
+		utils.ErrorF("HELM Could not find path %q in values %q", path, HelmChartValues)
+		os.Exit(1)
+	}
 
-	utils.Info("HELM Ingress Nginx Helm Chart update %s %s", key, value)
+	// Setup encoder with buffer and indent.
+	var encodedValues bytes.Buffer
+	encoder := yaml.NewEncoder(&encodedValues)
+	encoder.SetIndent(2)
+
+	// Encode the values.
+	err = encoder.Encode(&values)
+	utils.CheckIfError(err, "HELM Failed to encode values")
+
+	// Write the values to file.
+	//nolint:gosec // We need to write to the file with 644 permissions.
+	err = os.WriteFile(HelmChartValues, encodedValues.Bytes(), 0o644)
+	utils.CheckIfError(err, "HELM Failed to write values to file %q", HelmChartValues)
+
+	utils.Info("HELM Updated path %q to value %q in file %q", path, value, HelmChartValues)
 }
 
 func (Helm) Helmdocs() error {
@@ -169,7 +215,7 @@ func runHelmDocs() error {
 	if err != nil {
 		return err
 	}
-	err = sh.RunV("helm-docs", "--chart-search-root=${PWD}/charts")
+	err = sh.RunV("helm-docs", "--chart-search-root", "${PWD}/charts")
 	if err != nil {
 		return err
 	}
@@ -180,7 +226,7 @@ func installHelmDocs() error {
 	utils.Info("HELM Install HelmDocs")
 	g0 := sh.RunCmd("go")
 
-	err := g0("install", "github.com/norwoodj/helm-docs/cmd/helm-docs@v1.11.0")
+	err := g0("install", "github.com/norwoodj/helm-docs/cmd/helm-docs@latest")
 	if err != nil {
 		return err
 	}
